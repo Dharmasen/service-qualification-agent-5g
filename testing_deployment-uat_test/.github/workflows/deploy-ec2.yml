@@ -1,0 +1,287 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - uat_test
+      - staging_test
+      - prod_test
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if no changes'
+        required: false
+        default: 'false'
+
+env:
+  APP_NAME: agent-dk
+  PYTHON_VERSION: "3.11"
+  DOCKER_IMAGE: agent-dk
+  DOCKER_TAG: ${{ github.sha }}
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          if [[ "${{ github.ref_name }}" == "uat_test" ]]; then
+            echo "ENVIRONMENT=UAT" >> $GITHUB_OUTPUT
+            echo "ENV_SUFFIX=uat" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "staging_test" ]]; then
+            echo "ENVIRONMENT=STAGING" >> $GITHUB_OUTPUT
+            echo "ENV_SUFFIX=staging" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "prod_test" ]]; then
+            echo "ENVIRONMENT=PRODUCTION" >> $GITHUB_OUTPUT
+            echo "ENV_SUFFIX=prod" >> $GITHUB_OUTPUT
+          else
+            echo "ENVIRONMENT=DEVELOPMENT" >> $GITHUB_OUTPUT
+            echo "ENV_SUFFIX=dev" >> $GITHUB_OUTPUT
+          fi
+          echo "Deploying to: $(echo $ENVIRONMENT)"
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies locally (for testing)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run syntax checks
+        run: |
+          python -m py_compile src/*.py
+          echo "✅ Python syntax check passed"
+      
+      - name: Build Docker image
+        run: |
+          echo "🐋 Building Docker image for ${{ steps.env.outputs.ENVIRONMENT }}..."
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+          docker tag ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} ${{ env.DOCKER_IMAGE }}:latest
+          docker tag ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} ${{ env.DOCKER_IMAGE }}:${{ steps.env.outputs.ENV_SUFFIX }}-latest
+          echo "✅ Docker image built successfully"
+      
+      - name: Save Docker image to file
+        run: |
+          echo "💾 Saving Docker image to tar file..."
+          docker save ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} | gzip > ${{ env.DOCKER_IMAGE }}-${{ env.DOCKER_TAG }}.tar.gz
+          ls -lh ${{ env.DOCKER_IMAGE }}-${{ env.DOCKER_TAG }}.tar.gz
+          echo "✅ Docker image saved"
+      
+      - name: Copy Docker image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          password: ${{ secrets.EC2_PASSWORD }}
+          port: 22
+          source: "${{ env.DOCKER_IMAGE }}-${{ env.DOCKER_TAG }}.tar.gz"
+          target: "/tmp/"
+      
+      - name: Load and Deploy Docker Container on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          password: ${{ secrets.EC2_PASSWORD }}
+          port: 22
+          script: |
+            set -e
+            
+            echo "🚀 Starting Docker deployment to ${{ steps.env.outputs.ENVIRONMENT }}..."
+            echo "User: $(whoami)"
+            echo "Environment: ${{ steps.env.outputs.ENVIRONMENT }}"
+            echo "Image: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}"
+            
+            # Check if Docker is installed
+            if ! command -v docker &> /dev/null; then
+              echo "❌ Docker is not installed on this EC2 instance"
+              echo ""
+              echo "Please install Docker on your EC2 instance first:"
+              echo "  Amazon Linux 2:"
+              echo "    sudo yum update -y"
+              echo "    sudo yum install -y docker"
+              echo "    sudo systemctl start docker"
+              echo "    sudo systemctl enable docker"
+              echo '    sudo usermod -aG docker $(whoami)'
+              echo ""
+              echo "  Ubuntu/Debian:"
+              echo "    sudo apt-get update"
+              echo "    sudo apt-get install -y docker.io"
+              echo "    sudo systemctl start docker"
+              echo "    sudo systemctl enable docker"
+              echo '    sudo usermod -aG docker $(whoami)'
+              echo ""
+              echo "After installation, log out and log back in for group changes to take effect."
+              exit 1
+            fi
+            
+            echo "✅ Docker is installed"
+            
+            # Check if docker daemon is running
+            if ! docker ps &> /dev/null 2>&1; then
+              echo "⚠️ Docker daemon may not be running or user lacks permissions"
+              echo "Attempting to use sudo for Docker commands..."
+              DOCKER_CMD="sudo docker"
+              
+              # Verify sudo docker works
+              if ! $DOCKER_CMD ps &> /dev/null; then
+                echo "❌ Cannot access Docker even with sudo"
+                echo "Please ensure:"
+                echo "  1. Docker service is running: sudo systemctl start docker"
+                echo '  2. User is in docker group: sudo usermod -aG docker $(whoami)'
+                echo "  3. Log out and back in after adding to docker group"
+                exit 1
+              fi
+            else
+              echo "✅ Docker is accessible without sudo"
+              DOCKER_CMD="docker"
+            fi
+            
+            # Load Docker image from tar file
+            echo "📥 Loading Docker image from tar file..."
+            $DOCKER_CMD load -i /tmp/${{ env.DOCKER_IMAGE }}-${{ env.DOCKER_TAG }}.tar.gz
+            echo "✅ Docker image loaded"
+            
+            # Stop and remove existing container if it exists
+            echo "🛑 Stopping existing container..."
+            $DOCKER_CMD stop ${{ env.APP_NAME }} 2>/dev/null || true
+            $DOCKER_CMD rm ${{ env.APP_NAME }} 2>/dev/null || true
+            
+            # Remove old images (keep last 3)
+            echo "🧹 Cleaning up old images..."
+            $DOCKER_CMD images ${{ env.DOCKER_IMAGE }} --format "{{.ID}} {{.Tag}}" | tail -n +4 | awk '{print $1}' | xargs -r $DOCKER_CMD rmi 2>/dev/null || true
+            
+            # Clean up transferred tar file
+            rm -f /tmp/${{ env.DOCKER_IMAGE }}-${{ env.DOCKER_TAG }}.tar.gz
+            
+            # Create env file for container
+            echo "⚙️ Creating environment file..."
+            cat > /tmp/${{ env.APP_NAME }}.env <<EOF
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            AWS_REGION=${{ secrets.AWS_REGION }}
+            MODEL_NAME=us.anthropic.claude-3-5-sonnet-20241022-v2:0
+            TEMPERATURE=0.7
+            MAX_TOKENS=4096
+            TIMEOUT_SECONDS=60
+            ENVIRONMENT=${{ steps.env.outputs.ENVIRONMENT }}
+            LOG_LEVEL=INFO
+            PORT=8080
+            HOST=0.0.0.0
+            EOF
+            
+            # Run new container
+            echo "🚀 Starting new container..."
+            $DOCKER_CMD run -d \
+              --name ${{ env.APP_NAME }} \
+              --restart always \
+              -p 8080:8080 \
+              --env-file /tmp/${{ env.APP_NAME }}.env \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+            
+            # Clean up env file
+            rm /tmp/${{ env.APP_NAME }}.env
+            
+            # Wait for container to start
+            echo "⏳ Waiting for container to start..."
+            sleep 15
+            
+            # Check container status
+            if $DOCKER_CMD ps | grep -q ${{ env.APP_NAME }}; then
+              echo "✅ Container is running!"
+              echo ""
+              echo "Container details:"
+              $DOCKER_CMD ps --filter "name=${{ env.APP_NAME }}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+              echo ""
+              echo "Container logs (all):"
+              $DOCKER_CMD logs ${{ env.APP_NAME }}
+              echo ""
+              echo "Checking if application is listening on port 8080..."
+              $DOCKER_CMD exec ${{ env.APP_NAME }} netstat -tlnp 2>/dev/null | grep 8080 || echo "⚠️ Port 8080 not listening yet"
+            else
+              echo "❌ Container failed to start or stopped immediately"
+              echo "Container logs:"
+              $DOCKER_CMD logs ${{ env.APP_NAME }} 2>&1 || echo "No logs available"
+              exit 1
+            fi
+      
+      - name: Health Check
+        run: |
+          echo "Waiting for application to be ready..."
+          sleep 10
+          
+          # Try health check with retries
+          max_attempts=6
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt of $max_attempts..."
+            
+            response=$(curl -f -m 10 http://${{ secrets.EC2_HOST }}:8080/health 2>&1 || echo "failed")
+            
+            if [[ "$response" != "failed" ]] && [[ "$response" != *"Connection refused"* ]] && [[ "$response" != *"Couldn't connect"* ]]; then
+              echo "✅ Health check passed!"
+              echo "Response: $response"
+              exit 0
+            fi
+            
+            if [ $attempt -lt $max_attempts ]; then
+              echo "⚠️ Health check failed, retrying in 10 seconds..."
+              sleep 10
+            fi
+            
+            attempt=$((attempt + 1))
+          done
+          
+          echo "❌ Health check failed after $max_attempts attempts!"
+          exit 1
+      
+      - name: Fetch Container Logs on Failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          password: ${{ secrets.EC2_PASSWORD }}
+          port: 22
+          script: |
+            echo "=== Container Status ==="
+            docker ps -a --filter "name=agent-dk" || sudo docker ps -a --filter "name=agent-dk"
+            echo ""
+            echo "=== Container Logs (last 100 lines) ==="
+            docker logs agent-dk --tail 100 2>&1 || sudo docker logs agent-dk --tail 100 2>&1 || echo "Could not fetch logs"
+            echo ""
+            echo "=== Port Status ==="
+            netstat -tlnp | grep 8080 || ss -tlnp | grep 8080 || echo "Port 8080 not listening"
+            echo ""
+            echo "=== Docker Images ==="
+            docker images | grep agent-dk || sudo docker images | grep agent-dk
+      
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ steps.env.outputs.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **EC2 Host**: ${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access Points" >> $GITHUB_STEP_SUMMARY
+          echo "- Health: http://${{ secrets.EC2_HOST }}:8080/health" >> $GITHUB_STEP_SUMMARY
+          echo "- API Docs: http://${{ secrets.EC2_HOST }}:8080/docs" >> $GITHUB_STEP_SUMMARY
+          echo "- Query: POST http://${{ secrets.EC2_HOST }}:8080/query" >> $GITHUB_STEP_SUMMARY
